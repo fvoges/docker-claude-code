@@ -1,0 +1,215 @@
+name: Build and publish
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if upstream inputs are unchanged'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build.yml'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  BASE_IMAGE: node:22-slim
+  BASE_TAG_SLUG: 22-slim
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve desired upstream versions
+        id: desired
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CLAUDE_VERSION=$(npm view @anthropic-ai/claude-code dist-tags --json | jq -r '.latest')
+          [[ -n "$CLAUDE_VERSION" && "$CLAUDE_VERSION" != "null" ]] \
+            || { echo "npm dist-tag resolution failed" >&2; exit 1; }
+
+          BASE_DIGEST=$(docker buildx imagetools inspect \
+            "docker.io/library/${BASE_IMAGE}" --format '{{.Manifest.Digest}}')
+          [[ "$BASE_DIGEST" == sha256:* ]] \
+            || { echo "base digest resolution failed: $BASE_DIGEST" >&2; exit 1; }
+
+          BASE_SHORT=${BASE_DIGEST#sha256:}
+          BASE_SHORT=${BASE_SHORT:0:8}
+
+          {
+            echo "claude_version=$CLAUDE_VERSION"
+            echo "base_digest=$BASE_DIGEST"
+            echo "base_short=$BASE_SHORT"
+            echo "immutable_tag=${BASE_TAG_SLUG}-${CLAUDE_VERSION}-${BASE_SHORT}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Desired: claude=$CLAUDE_VERSION base=$BASE_DIGEST"
+
+      - name: Read prior build inputs from GHCR :latest
+        id: prior
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          REPO=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          BASE_URL="https://ghcr.io/v2/$REPO"
+          AUTH=(-u "$GHCR_USER:$GHCR_TOKEN")
+
+          if ! INDEX=$(curl -fsSL "${AUTH[@]}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+              "$BASE_URL/manifests/latest" 2>/dev/null); then
+            echo "No :latest found (first run). Will build."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AMD64_MANIFEST_DIGEST=$(echo "$INDEX" \
+            | jq -r '.manifests[]? | select(.platform.os=="linux" and .platform.architecture=="amd64") | .digest' \
+            | head -n1)
+          if [[ -z "$AMD64_MANIFEST_DIGEST" || "$AMD64_MANIFEST_DIGEST" == "null" ]]; then
+            echo "Could not find amd64 manifest in :latest index. Will rebuild."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MANIFEST=$(curl -fsSL "${AUTH[@]}" \
+            -H "Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+            "$BASE_URL/manifests/$AMD64_MANIFEST_DIGEST")
+          CONFIG_DIGEST=$(echo "$MANIFEST" | jq -r '.config.digest')
+
+          CONFIG=$(curl -fsSL "${AUTH[@]}" "$BASE_URL/blobs/$CONFIG_DIGEST")
+          PRIOR_BASE_DIGEST=$(echo "$CONFIG" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // ""')
+          PRIOR_CLAUDE_VERSION=$(echo "$CONFIG" | jq -r '.config.Labels["io.anthropic.claude-code.version"] // ""')
+
+          {
+            echo "exists=true"
+            echo "base_digest=$PRIOR_BASE_DIGEST"
+            echo "claude_version=$PRIOR_CLAUDE_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Prior:   claude=$PRIOR_CLAUDE_VERSION base=$PRIOR_BASE_DIGEST"
+
+      - name: Decide whether to build
+        id: decide
+        shell: bash
+        env:
+          FORCE: ${{ inputs.force }}
+          EVENT: ${{ github.event_name }}
+          PRIOR_EXISTS: ${{ steps.prior.outputs.exists }}
+          PRIOR_BASE: ${{ steps.prior.outputs.base_digest }}
+          PRIOR_CLAUDE: ${{ steps.prior.outputs.claude_version }}
+          DESIRED_BASE: ${{ steps.desired.outputs.base_digest }}
+          DESIRED_CLAUDE: ${{ steps.desired.outputs.claude_version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$FORCE" == "true" || "$EVENT" == "push" || "$PRIOR_EXISTS" != "true" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$PRIOR_BASE" != "$DESIRED_BASE" || "$PRIOR_CLAUDE" != "$DESIRED_CLAUDE" ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes. Skipping build."
+          fi
+
+      - name: Set up QEMU
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build and push
+        id: push
+        if: steps.decide.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: true
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            CLAUDE_CODE_VERSION=${{ steps.desired.outputs.claude_version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.desired.outputs.claude_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BASE_TAG_SLUG }}-${{ steps.desired.outputs.claude_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.desired.outputs.immutable_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.base.name=${{ env.BASE_IMAGE }}
+            org.opencontainers.image.base.digest=${{ steps.desired.outputs.base_digest }}
+            io.anthropic.claude-code.version=${{ steps.desired.outputs.claude_version }}
+            io.anthropic.claude-code.dist-tag=latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        if: steps.decide.outputs.build == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless, OIDC)
+        if: steps.decide.outputs.build == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_REF}@${DIGEST}"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          DECISION: ${{ steps.decide.outputs.build == 'true' && 'BUILT' || 'skipped' }}
+          DESIRED_CLAUDE: ${{ steps.desired.outputs.claude_version }}
+          DESIRED_BASE: ${{ steps.desired.outputs.base_digest }}
+          PRIOR_CLAUDE: ${{ steps.prior.outputs.claude_version }}
+          PRIOR_BASE: ${{ steps.prior.outputs.base_digest }}
+          IMMUTABLE_TAG: ${{ steps.desired.outputs.immutable_tag }}
+        run: |
+          {
+            echo "### docker-claude-code build"
+            echo ""
+            echo "- Decision:       $DECISION"
+            echo "- Claude version: $DESIRED_CLAUDE"
+            echo "- Base digest:    $DESIRED_BASE"
+            echo "- Prior claude:   $PRIOR_CLAUDE"
+            echo "- Prior base:     $PRIOR_BASE"
+            echo "- Immutable tag:  $IMMUTABLE_TAG"
+          } >> "$GITHUB_STEP_SUMMARY"
